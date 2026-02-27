@@ -12,7 +12,8 @@ import (
 )
 
 func main() {
-	inputPath := "./dnsmasq-clip.log"
+	//inputPath := "./dnsmasq-clip.log"
+        inputPath := "/var/log/dnsmasq.log"
 	dbPath := "unique_domains.db"
 
 	fmt.Printf("Parsing: %s\n", inputPath)
