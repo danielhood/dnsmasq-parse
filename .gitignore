@@ -17,4 +17,5 @@
 .continue/
 *.log
 unique_domains.txt
+unique_domains_by_first_seen.txt
 unique_domains.db
