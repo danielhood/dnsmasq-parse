@@ -13,7 +13,7 @@ import (
 )
 
 func main() {
-	inputPath := "./dnsmasq-clip.log"
+	inputPath := "./dnsmasq.log"
 	//inputPath := "/var/log/dnsmasq.log"
 	dbPath := "unique_domains.db"
 
@@ -146,7 +146,7 @@ func extractDomainAndTimestamp(line string) (string, int64) {
 	domainPart := line[15:]
 
 	layout := "Jan _2 15:04:05"
-	timestamp, err := time.Parse(layout, timestampPart)
+	timestamp, err := time.ParseInLocation(layout, timestampPart, time.Local)
 	if err != nil {
 		fmt.Printf("Error parsing timestamp: %v\n", err)
 		return "", 0
