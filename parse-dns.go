@@ -74,6 +74,9 @@ func main() {
 		return
 	}
 
+	// Ensure the terminal doesn't stay on the progress line.
+	fmt.Fprintln(os.Stderr)
+
 	fmt.Println("Process completed successfully.")
 }
 
@@ -118,8 +121,6 @@ func startProgressIndicator(file *os.File, linesProcessed *uint64) func() {
 	return func() {
 		close(done)
 		ticker.Stop()
-		// Ensure the terminal doesn't stay on the progress line.
-		fmt.Fprintln(os.Stderr)
 	}
 }
 
