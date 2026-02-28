@@ -4,16 +4,18 @@ import (
 	"bufio"
 	"database/sql"
 	"fmt"
+	"io"
 	"os"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	_ "modernc.org/sqlite"
 )
 
 func main() {
-	//inputPath := "./dnsmasq-clip.log"
-        inputPath := "/var/log/dnsmasq.log"
+	inputPath := "./dnsmasq.log"
+	//inputPath := "/var/log/dnsmasq.log"
 	dbPath := "unique_domains.db"
 
 	fmt.Printf("Parsing: %s\n", inputPath)
@@ -33,16 +35,36 @@ func main() {
 
 	scanner := bufio.NewScanner(file)
 
+	var linesProcessed uint64
+	domainTimesMap := make(map[string]domainTimes)
+	stopProgress := startProgressIndicator(file, &linesProcessed)
+	defer stopProgress()
+
 	for scanner.Scan() {
 		line := scanner.Text()
+		atomic.AddUint64(&linesProcessed, 1)
 		domain, timestamp := extractDomainAndTimestamp(line)
 		if domain != "" {
-			addOrUpdateUniqueDomain(dbPath, domain, timestamp)
+			reversed := reverseDomainParts(domain)
+			current := domainTimesMap[reversed]
+			// Initialize first_seen/last_seen for new domains
+			if current.FirstSeen == 0 || timestamp < current.FirstSeen {
+				current.FirstSeen = timestamp
+			}
+			if timestamp > current.LastSeen {
+				current.LastSeen = timestamp
+			}
+			domainTimesMap[reversed] = current
 		}
 	}
 
 	if err := scanner.Err(); err != nil {
 		fmt.Printf("Error scanning: %v\n", err)
+		return
+	}
+
+	if err := saveDomainsToDatabase(dbPath, domainTimesMap); err != nil {
+		fmt.Printf("Error saving domains to database: %v\n", err)
 		return
 	}
 
@@ -53,6 +75,52 @@ func main() {
 	}
 
 	fmt.Println("Process completed successfully.")
+}
+
+type domainTimes struct {
+	FirstSeen int64
+	LastSeen  int64
+}
+
+func startProgressIndicator(file *os.File, linesProcessed *uint64) func() {
+	var totalSize int64
+	if st, err := file.Stat(); err == nil {
+		totalSize = st.Size()
+	}
+
+	start := time.Now()
+	ticker := time.NewTicker(250 * time.Millisecond)
+	done := make(chan struct{})
+
+	go func() {
+		for {
+			select {
+			case <-ticker.C:
+				lines := atomic.LoadUint64(linesProcessed)
+				pos, err := file.Seek(0, io.SeekCurrent)
+				if err == nil && totalSize > 0 {
+					pct := (float64(pos) / float64(totalSize)) * 100
+					fmt.Fprintf(os.Stderr, "\rProgress: %6.2f%%  %d/%d bytes  %d lines  elapsed %s      ",
+						pct, pos, totalSize, lines, time.Since(start).Truncate(time.Second))
+				} else if err == nil {
+					fmt.Fprintf(os.Stderr, "\rProgress: %d bytes  %d lines  elapsed %s      ",
+						pos, lines, time.Since(start).Truncate(time.Second))
+				} else {
+					fmt.Fprintf(os.Stderr, "\rProgress: %d lines  elapsed %s      ",
+						lines, time.Since(start).Truncate(time.Second))
+				}
+			case <-done:
+				return
+			}
+		}
+	}()
+
+	return func() {
+		close(done)
+		ticker.Stop()
+		// Ensure the terminal doesn't stay on the progress line.
+		fmt.Fprintln(os.Stderr)
+	}
 }
 
 func initDatabase(dbPath string) error {
@@ -93,15 +161,15 @@ func extractDomainAndTimestamp(line string) (string, int64) {
 	if err != nil {
 		fmt.Printf("Error parsing timestamp: %v\n", err)
 		return "", 0
-        }
+	}
 
-        // fmt.Printf("Timestamp: %d\n", timestamp.Unix())
+	// fmt.Printf("Timestamp: %d\n", timestamp.Unix())
 
 	parts := strings.Fields(domainPart)
 	for i, part := range parts {
 		if strings.HasPrefix(part, "query[") && i+1 < len(parts) {
 			domain := parts[i+1]
-                        // fmt.Printf("Found domain: %s\n", domain)
+			// fmt.Printf("Found domain: %s\n", domain)
 			return domain, timestamp.Unix()
 		}
 	}
@@ -117,33 +185,43 @@ func reverseDomainParts(domain string) string {
 	return strings.Join(parts, ".")
 }
 
-func addOrUpdateUniqueDomain(dbPath, domain string, timestamp int64) error {
+func saveDomainsToDatabase(dbPath string, domains map[string]domainTimes) error {
 	db, err := sql.Open("sqlite", dbPath)
 	if err != nil {
 		return err
 	}
 	defer db.Close()
 
-	domain = reverseDomainParts(domain)
-
-	// Check if the domain already exists
-	var firstSeen int64
-	err = db.QueryRow("SELECT first_seen FROM domains WHERE domain = ?", domain).Scan(&firstSeen)
-	if err == nil {
-		// Update the last seen timestamp
-		updateSQL := `
-		UPDATE domains SET last_seen = ? WHERE domain = ?
-		`
-		_, err = db.Exec(updateSQL, timestamp, domain)
+	tx, err := db.Begin()
+	if err != nil {
 		return err
 	}
 
-	// If not found, insert a new record with last_seen set, first_seen defaults to current time
-	insertSQL := `
-	INSERT INTO domains (domain, last_seen) VALUES (?, ?);
-	`
-	_, err = db.Exec(insertSQL, domain, timestamp)
-	return err
+	stmt, err := tx.Prepare(`
+		INSERT INTO domains (domain, first_seen, last_seen)
+		VALUES (?, ?, ?)
+		ON CONFLICT(domain) DO UPDATE SET
+			first_seen = MIN(first_seen, excluded.first_seen),
+			last_seen = MAX(last_seen, excluded.last_seen)
+	`)
+	if err != nil {
+		tx.Rollback()
+		return err
+	}
+	defer stmt.Close()
+
+	for domain, times := range domains {
+		if _, err := stmt.Exec(domain, times.FirstSeen, times.LastSeen); err != nil {
+			tx.Rollback()
+			return err
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+
+	return nil
 }
 
 func sortAndExportDatabase(dbPath string) error {
@@ -159,11 +237,11 @@ func sortAndExportDatabase(dbPath string) error {
 	}
 	defer rows.Close()
 
-        err = writeRowsToFile(rows, "unique_domains.txt")
+	err = writeRowsToFile(rows, "unique_domains.txt")
 
-        if err != nil {
-                return err
-        }
+	if err != nil {
+		return err
+	}
 
 	rows, err = db.Query("SELECT domain, first_seen, last_seen FROM domains ORDER BY first_seen DESC")
 	if err != nil {
@@ -171,13 +249,13 @@ func sortAndExportDatabase(dbPath string) error {
 	}
 	defer rows.Close()
 
-        err = writeRowsToFile(rows, "unique_domains_by_first_seen.txt")
+	err = writeRowsToFile(rows, "unique_domains_by_first_seen.txt")
 
-        if err != nil {
-                return err
-        }
+	if err != nil {
+		return err
+	}
 
-        return err
+	return err
 }
 
 func writeRowsToFile(rows *sql.Rows, outputPath string) error {
@@ -189,14 +267,14 @@ func writeRowsToFile(rows *sql.Rows, outputPath string) error {
 	}
 	for rows.Next() {
 		var domain sql.NullString
-                var firstSeen, lastSeen int64
+		var firstSeen, lastSeen int64
 
 		err := rows.Scan(&domain, &firstSeen, &lastSeen)
 		if err != nil {
 			return err
 		}
 
-                // Convert null string to regular string if not NULL
+		// Convert null string to regular string if not NULL
 		domainStr := ""
 		if domain.Valid {
 			domainStr = domain.String
@@ -221,10 +299,10 @@ func writeRowsToFile(rows *sql.Rows, outputPath string) error {
 
 	writer := bufio.NewWriter(outFile)
 	for _, domainInfo := range uniqueDomains {
-		fmt.Fprintf(writer, "%s\t%s\t%s\n", 
-                        domainInfo.Domain, 
-                        unixToDateTime(domainInfo.FirstSeen), 
-                        unixToDateTime(domainInfo.LastSeen))
+		fmt.Fprintf(writer, "%s\t%s\t%s\n",
+			unixToDateTime(domainInfo.FirstSeen),
+			unixToDateTime(domainInfo.LastSeen),
+			domainInfo.Domain)
 	}
 	writer.Flush()
 
