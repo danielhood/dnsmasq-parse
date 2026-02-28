@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"database/sql"
 	"fmt"
-	"io"
 	"os"
 	"strings"
 	"sync/atomic"
@@ -37,8 +36,6 @@ func main() {
 
 	var linesProcessed uint64
 	domainTimesMap := make(map[string]domainTimes)
-	stopProgress := startProgressIndicator(file, &linesProcessed)
-	defer stopProgress()
 
 	for scanner.Scan() {
 		line := scanner.Text()
@@ -46,14 +43,14 @@ func main() {
 		domain, timestamp := extractDomainAndTimestamp(line)
 		if domain != "" {
 			reversed := reverseDomainParts(domain)
-			current := domainTimesMap[reversed]
-			// Initialize first_seen/last_seen for new domains
-			if current.FirstSeen == 0 || timestamp < current.FirstSeen {
+			current, exists := domainTimesMap[reversed]
+			if !exists {
 				current.FirstSeen = timestamp
-			}
-			if timestamp > current.LastSeen {
+				current.LastSeen = timestamp
+			} else {
 				current.LastSeen = timestamp
 			}
+
 			domainTimesMap[reversed] = current
 		}
 	}
@@ -74,54 +71,12 @@ func main() {
 		return
 	}
 
-	// Ensure the terminal doesn't stay on the progress line.
-	fmt.Fprintln(os.Stderr)
-
 	fmt.Println("Process completed successfully.")
 }
 
 type domainTimes struct {
 	FirstSeen int64
 	LastSeen  int64
-}
-
-func startProgressIndicator(file *os.File, linesProcessed *uint64) func() {
-	var totalSize int64
-	if st, err := file.Stat(); err == nil {
-		totalSize = st.Size()
-	}
-
-	start := time.Now()
-	ticker := time.NewTicker(250 * time.Millisecond)
-	done := make(chan struct{})
-
-	go func() {
-		for {
-			select {
-			case <-ticker.C:
-				lines := atomic.LoadUint64(linesProcessed)
-				pos, err := file.Seek(0, io.SeekCurrent)
-				if err == nil && totalSize > 0 {
-					pct := (float64(pos) / float64(totalSize)) * 100
-					fmt.Fprintf(os.Stderr, "\rProgress: %6.2f%%  %d/%d bytes  %d lines  elapsed %s      ",
-						pct, pos, totalSize, lines, time.Since(start).Truncate(time.Second))
-				} else if err == nil {
-					fmt.Fprintf(os.Stderr, "\rProgress: %d bytes  %d lines  elapsed %s      ",
-						pos, lines, time.Since(start).Truncate(time.Second))
-				} else {
-					fmt.Fprintf(os.Stderr, "\rProgress: %d lines  elapsed %s      ",
-						lines, time.Since(start).Truncate(time.Second))
-				}
-			case <-done:
-				return
-			}
-		}
-	}()
-
-	return func() {
-		close(done)
-		ticker.Stop()
-	}
 }
 
 func initDatabase(dbPath string) error {
