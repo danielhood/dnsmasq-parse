@@ -13,7 +13,7 @@ import (
 )
 
 func main() {
-	inputPath := "./dnsmasq.log"
+	inputPath := "./dnsmasq-clip.log"
 	//inputPath := "/var/log/dnsmasq.log"
 	dbPath := "unique_domains.db"
 
@@ -32,10 +32,15 @@ func main() {
 		return
 	}
 
+	domainTimesMap, err := loadDomainsFromDatabase(dbPath)
+	if err != nil {
+		fmt.Printf("Error loading domains from database: %v\n", err)
+		return
+	}
+
 	scanner := bufio.NewScanner(file)
 
 	var linesProcessed uint64
-	domainTimesMap := make(map[string]domainTimes)
 
 	for scanner.Scan() {
 		line := scanner.Text()
@@ -101,6 +106,34 @@ func initDatabase(dbPath string) error {
 	}
 
 	return nil
+}
+
+func loadDomainsFromDatabase(dbPath string) (map[string]domainTimes, error) {
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		return nil, err
+	}
+	defer db.Close()
+
+	rows, err := db.Query("SELECT domain, first_seen, last_seen FROM domains")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	m := make(map[string]domainTimes)
+	for rows.Next() {
+		var domain string
+		var firstSeen, lastSeen int64
+		if err := rows.Scan(&domain, &firstSeen, &lastSeen); err != nil {
+			return nil, err
+		}
+		m[domain] = domainTimes{FirstSeen: firstSeen, LastSeen: lastSeen}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return m, nil
 }
 
 func extractDomainAndTimestamp(line string) (string, int64) {
