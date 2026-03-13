@@ -232,19 +232,78 @@ func sortAndExportDatabase(dbPath string) error {
 		return err
 	}
 
-	rows, err = db.Query("SELECT domain, first_seen, last_seen FROM domains ORDER BY first_seen DESC")
+	rows, err = db.Query("SELECT domain, first_seen, last_seen FROM domains ORDER BY first_seen ASC")
 	if err != nil {
 		return err
 	}
 	defer rows.Close()
 
-	err = writeRowsToFile(rows, "unique_domains_by_first_seen.txt")
-
+	err = writeFirstSeenByPrefixToFile(rows, "unique_domains_by_first_seen.txt")
 	if err != nil {
 		return err
 	}
 
-	return err
+	return nil
+}
+
+// firstTwoComponents returns the first two dot-separated components of domain (e.g. "com.example.www" -> "com.example").
+func firstTwoComponents(domain string) string {
+	parts := strings.SplitN(domain, ".", 3)
+	if len(parts) < 2 {
+		return domain
+	}
+	return parts[0] + "." + parts[1]
+}
+
+// writeFirstSeenByPrefixToFile writes one row per distinct first-two-components prefix:
+// the domain with the earliest first_seen for that prefix. Rows are written in first_seen ascending order.
+func writeFirstSeenByPrefixToFile(rows *sql.Rows, outputPath string) error {
+	type domainRow struct {
+		Domain    string
+		FirstSeen int64
+		LastSeen  int64
+	}
+	var byPrefix []domainRow
+	seenPrefix := make(map[string]bool)
+
+	for rows.Next() {
+		var domain sql.NullString
+		var firstSeen, lastSeen int64
+		if err := rows.Scan(&domain, &firstSeen, &lastSeen); err != nil {
+			return err
+		}
+		domainStr := ""
+		if domain.Valid {
+			domainStr = domain.String
+		}
+		prefix := firstTwoComponents(domainStr)
+		if seenPrefix[prefix] {
+			continue
+		}
+		seenPrefix[prefix] = true
+		byPrefix = append(byPrefix, domainRow{domainStr, firstSeen, lastSeen})
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	outFile, err := os.Create(outputPath)
+	if err != nil {
+		return err
+	}
+	defer outFile.Close()
+
+	writer := bufio.NewWriter(outFile)
+	for _, row := range byPrefix {
+		fmt.Fprintf(writer, "%s\t%s\t%s\n",
+			unixToDateTime(row.FirstSeen),
+			unixToDateTime(row.LastSeen),
+			row.Domain)
+	}
+	writer.Flush()
+
+	fmt.Printf("Saved %d unique domains (by first two components) to %s\n", len(byPrefix), outputPath)
+	return nil
 }
 
 func writeRowsToFile(rows *sql.Rows, outputPath string) error {
